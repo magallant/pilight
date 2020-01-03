@@ -1,1 +1,0 @@
-/usr/bin/cc   -Wall -O2 -g -DDEBUG    -Wl,-rpath=.,-rpath=/usr/local/lib/,-rpath=/usr/lib/,-rpath=/lib/ CMakeFiles/pilight-flash.dir/flash.c.o  -o pilight-flash -rdynamic libpilight.so -ldl -lm -lpthread -lrt -ldl -lwiringx -lmbedtls -lmbedcrypto -lmbedx509 -lluajit-5.1 -lpcap 
