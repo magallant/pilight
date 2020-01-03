@@ -1,0 +1,595 @@
+/*
+	Copyright (C) 2014 CurlyMo & hstroh
+
+	This file is part of pilight.
+
+	pilight is free software: you can redistribute it and/or modify it under the
+	terms of the GNU General Public License as published by the Free Software
+	Foundation, either version 3 of the License, or (at your option) any later
+	version.
+
+	pilight is distributed in the hope that it will be useful, but WITHOUT ANY
+	WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+	A PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+
+	You should have received a copy of the GNU General Public License
+	along with pilight. If not, see	<http://www.gnu.org/licenses/>
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <dirent.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <math.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#ifndef _WIN32
+	#ifdef __mips__
+		#define __USE_UNIX98
+	#endif
+	#include <wiringx.h>
+#endif
+#include <pthread.h>
+#include <assert.h>
+
+#include "../../core/pilight.h"
+#include "../../core/common.h"
+#include "../../core/dso.h"
+#include "../../core/log.h"
+#include "../../core/threads.h"
+#include "../../core/binary.h"
+#include "../../core/gc.h"
+#include "../../core/json.h"
+#include "../../config/settings.h"
+#include "../protocol.h"
+#include "bme280.h"
+
+#if !defined(__FreeBSD__) && !defined(_WIN32)
+
+typedef struct settings_t {
+	char **id;
+	int nrid;
+	char path[PATH_MAX];
+	int *fd;
+	// calibration values (stored in each BME280)
+	unsigned short *dig_t1;
+	short *dig_t2;
+	short *dig_t3;
+	unsigned short *dig_p1;
+	short *dig_p2;
+	short *dig_p3;
+	short *dig_p4;
+	short *dig_p5;
+	short *dig_p6;
+	short *dig_p7;
+	short *dig_p8;
+	short *dig_p9;
+	unsigned char *dig_h1;
+	short *dig_h2;
+	unsigned char *dig_h3;
+	short *dig_h4;
+	short *dig_h5;
+	char *dig_h6;
+//        short *mb;
+//        short *mc;
+//	short *md;
+} settings_t;
+
+static unsigned short loop = 1;
+static int threads = 0;
+
+static pthread_mutex_t lock;
+static pthread_mutexattr_t attr;
+
+// helper function with built-in result conversion
+static int readReg16(int fd, int reg) {
+	int res = wiringXI2CReadReg16(fd, reg);
+	// convert result to 16 bits and swap bytes
+	return ((res << 8) & 0xFF00) | ((res >> 8) & 0xFF);
+}
+
+static void *thread(void *param) {
+	struct protocol_threads_t *node = (struct protocol_threads_t *) param;
+	struct JsonNode *json = (struct JsonNode *) node->param;
+	struct JsonNode *jid = NULL;
+	struct JsonNode *jchild = NULL;
+	struct settings_t *bme280data = MALLOC(sizeof(struct settings_t));
+	int y = 0, interval = 10, nrloops = 0;
+	char *stmp = NULL;
+	double itmp = -1, temp_offset = 0, pressure_offset = 0;
+	unsigned char oversampling = 1;
+
+	if(bme280data == NULL) {
+		fprintf(stderr, "out of memory\n");
+		exit(EXIT_FAILURE);
+	}
+
+	bme280data->nrid = 0;
+	bme280data->id = NULL;
+	bme280data->fd = 0;
+	bme280data->dig_t1 = 0;
+	bme280data->dig_t2 = 0;
+	bme280data->dig_t3 = 0;
+	bme280data->dig_p1 = 0;
+	bme280data->dig_p2 = 0;
+	bme280data->dig_p3 = 0;
+        bme280data->dig_p4 = 0;
+        bme280data->dig_p5 = 0;
+        bme280data->dig_p6 = 0;
+        bme280data->dig_p7 = 0;
+        bme280data->dig_p8 = 0;
+        bme280data->dig_p9 = 0;
+	bme280data->dig_h1 = 0;
+	bme280data->dig_h2 = 0;
+        bme280data->dig_h3 = 0;
+        bme280data->dig_h4 = 0;
+        bme280data->dig_h5 = 0;
+        bme280data->dig_h6 = 0;
+
+//	bme280data->mb = 0;
+//	bme280data->mc = 0;
+//	bme280data->md = 0;
+
+	threads++;
+
+	if((jid = json_find_member(json, "id"))) {
+		jchild = json_first_child(jid);
+		while(jchild) {
+			if(json_find_string(jchild, "id", &stmp) == 0) {
+				if((bme280data->id = REALLOC(bme280data->id, (sizeof(char *) * (size_t)(bme280data->nrid + 1)))) == NULL) {
+					fprintf(stderr, "out of memory\n");
+					exit(EXIT_FAILURE);
+				}
+				if((bme280data->id[bme280data->nrid] = MALLOC(strlen(stmp) + 1)) == NULL) {
+					fprintf(stderr, "out of memory\n");
+					exit(EXIT_FAILURE);
+				}
+				strcpy(bme280data->id[bme280data->nrid], stmp);
+				bme280data->nrid++;
+			}
+			if(json_find_string(jchild, "i2c-path", &stmp) == 0) {
+				strcpy(bme280data->path, stmp);
+			}
+			jchild = jchild->next;
+		}
+	}
+
+	if(json_find_number(json, "poll-interval", &itmp) == 0)
+		interval = (int) round(itmp);
+	json_find_number(json, "temperature-offset", &temp_offset);
+	json_find_number(json, "pressure-offset", &pressure_offset);
+	if(json_find_number(json, "oversampling", &itmp) == 0) {
+		oversampling = (unsigned char) itmp;
+	}
+
+	// resize the memory blocks pointed to by the different pointers
+	size_t sz = (size_t) (bme280data->nrid + 1);
+	unsigned long int sizeShort = sizeof(short) * sz;
+	unsigned long int sizeUShort = sizeof(unsigned short) * sz;
+	bme280data->fd = REALLOC(bme280data->fd, (sizeof(int) * sz));
+	bme280data->dig_t1 = REALLOC(bme280data->dig_t1, sizeUShort);
+	bme280data->dig_t2 = REALLOC(bme280data->dig_t2, sizeShort);
+	bme280data->dig_t3 = REALLOC(bme280data->dig_t3, sizeShort);
+	bme280data->dig_p1 = REALLOC(bme280data->dig_p1, sizeUShort);
+	bme280data->dig_p2 = REALLOC(bme280data->dig_p2, sizeShort);
+	bme280data->dig_p3 = REALLOC(bme280data->dig_p3, sizeShort);
+        bme280data->dig_p4 = REALLOC(bme280data->dig_p4, sizeShort);
+        bme280data->dig_p5 = REALLOC(bme280data->dig_p5, sizeShort);
+        bme280data->dig_p6 = REALLOC(bme280data->dig_p6, sizeShort);
+        bme280data->dig_p7 = REALLOC(bme280data->dig_p7, sizeShort);
+        bme280data->dig_p8 = REALLOC(bme280data->dig_p8, sizeShort);
+        bme280data->dig_p9 = REALLOC(bme280data->dig_p9, sizeShort);
+	bme280data->dig_h1 = REALLOC(bme280data->dig_h1, sizeUChar);
+	bme280data->dig_h2 = REALLOC(bme280data->dig_h2, sizeShort);
+        bme280data->dig_h3 = REALLOC(bme280data->dig_h3, sizeUChar);
+        bme280data->dig_h4 = REALLOC(bme280data->dig_h4, sizeShort);
+        bme280data->dig_h5 = REALLOC(bme280data->dig_h5, sizeShort);
+        bme280data->dig_h6 = REALLOC(bme280data->dig_h6, sizeChar);
+
+//	bme280data->mb = REALLOC(bme280data->mb, sizeShort);
+//	bme280data->mc = REALLOC(bme280data->mc, sizeShort);
+//	bme280data->md = REALLOC(bme280data->md, sizeShort);
+	if(bme280data->dig_t1 == NULL || bme280data->dig_t2 == NULL || bme280data->dig_t3 == NULL || bme280data->dig_p1 == NULL ||
+	  bme280data->dig_p2 == NULL || bme280data->dig_p3 == NULL || bme280data->dig_p4 == NULL || bme280data->dig_p5 == NULL ||
+          bme280data->dig_p6 == NULL || bme280data->dig_p7 == NULL || bme280data->dig_p8 == NULL || bme280data->dig_p9 == NULL ||
+          bme280data->dig_h1 == NULL || bme280data->dig_h2 == NULL || bme280data->dig_h3 == NULL || bme280data->dig_h4 == NULL ||
+          bme280data->dig_h5 == NULL || bme280data->dig_h6 == NULL || bme280data->fd == NULL) {
+		fprintf(stderr, "out of memory\n");
+		exit(EXIT_FAILURE);
+	}
+
+	for(y = 0; y < bme280data->nrid; y++) {
+		// setup i2c
+		bme280data->fd[y] = wiringXI2CSetup(bme280data->path, (int)strtol(bme280data->id[y], NULL, 16));
+		if(bme280data->fd[y] > 0) {
+			// read 0xD0 to check chip id: must equal 0x60 for BME280
+			int id = wiringXI2CReadReg8(bme280data->fd[y], 0xD0);
+			if(id != 0x60) {
+				logprintf(LOG_ERR, "wrong device detected");
+				exit(EXIT_FAILURE);
+			}
+
+			//// read 0xD1 to check chip version: must equal 0x01 for BMP085 or 0x02 for BMP180
+			//int version = wiringXI2CReadReg8(bmp180data->fd[y], 0xD1);
+			//if(version != 0x01 && version != 0x02) {
+			//	logprintf(LOG_ERR, "wrong device detected");
+			//	exit(EXIT_FAILURE);
+			//}
+
+			// read calibration coefficients from register addresses
+			bme280data->dig_t1[y] = (unsigned short) wiringXI2CReadReg16(bme280data->fd[y], 0x88);
+			bme280data->dig_t2[y] = (short) wiringXI2CReadReg16(bme280data->fd[y], 0x8A);
+			bme280data->dig_t3[y] = (short) wiringXI2CReadReg16(bme280data->fd[y], 0x8C);
+
+			bme280data->dig_p1[y] = (unsigned short) wiringXI2CReadReg16(bme280data->fd[y], 0x8E);
+			bme280data->dig_p2[y] = (short) wiringXI2CReadReg16(bme280data->fd[y], 0x90);
+			bme280data->dig_p3[y] = (short) wiringXI2CReadReg16(bme280data->fd[y], 0x92);
+			bme280data->dig_p4[y] = (short) wiringXI2CReadReg16(bme280data->fd[y], 0x94);
+			bme280data->dig_p5[y] = (short) wiringXI2CReadReg16(bme280data->fd[y], 0x96);
+			bme280data->dig_p6[y] = (short) wiringXI2CReadReg16(bme280data->fd[y], 0x98);
+			bme280data->dig_p7[y] = (short) wiringXI2CReadReg16(bme280data->fd[y], 0x9A);
+			bme280data->dig_p8[y] = (short) wiringXI2CReadReg16(bme280data->fd[y], 0x9C);
+                        bme280data->dig_p9[y] = (short) wiringXI2CReadReg16(bme280data->fd[y], 0x9E);
+
+                        bme280data->dig_h1[y] = (unsigned char) wiringXI2CReadReg8(bme280data->fd[y], 0xA1);
+                        bme280data->dig_h2[y] = (short) wiringXI2CReadReg16(bme280data->fd[y], 0xE1);
+                        bme280data->dig_h3[y] = (unsigned char) wiringXI2CReadReg8(bme280data->fd[y], 0xE3);
+			bme280data->dig_h4[y] = (short) (wiringXI2CReadReg8(bme280data->fd[y], 0xE4) << 4) | (wiringXI2CReadReg8(bme280data->fd[y], 0xE5) & 0xF);
+                        bme280data->dig_h5[y] = (short) (wiringXI2CReadReg8(bme280data->fd[y], 0xE6) << 4) | (wiringXI2CReadReg8(bme280data->fd[y], 0xE5) >> 4);
+                        bme280data->dig_h6[y] = (signed char) wiringXI2CReadReg8(bme280data->fd[y], 0xE7);
+
+
+			// check communication: no result must equal 0 or 0xFFFF (=65535)
+			if (bme280data->dig_t1[y] == 0 || bme280data->dig_t1[y] == 0xFFFF ||
+					bme280data->dig_t2[y] == 0 || bme280data->dig_t2[y] == 0xFFFF ||
+					bme280data->dig_t3[y] == 0 || bme280data->dig_t3[y] == 0xFFFF ||
+					bme280data->dig_p1[y] == 0 || bme280data->dig_p1[y] == 0xFFFF ||
+					bme280data->dig_p2[y] == 0 || bme280data->dig_p2[y] == 0xFFFF ||
+					bme280data->dig_p3[y] == 0 || bme280data->dig_p3[y] == 0xFFFF ||
+					bme280data->dig_p4[y] == 0 || bme280data->dig_p4[y] == 0xFFFF ||
+					bme280data->dig_p5[y] == 0 || bme280data->dig_p5[y] == 0xFFFF ||
+					bme280data->dig_p6[y] == 0 || bme280data->dig_p6[y] == 0xFFFF ||
+					bme280data->dig_p7[y] == 0 || bme280data->dig_p7[y] == 0xFFFF ||
+                                        bme280data->dig_p8[y] == 0 || bme280data->dig_p8[y] == 0xFFFF ||
+                                        bme280data->dig_p9[y] == 0 || bme280data->dig_p9[y] == 0xFFFF ||
+                                        bme280data->dig_h1[y] == 0 || bme280data->dig_h1[y] == 0xFF ||
+                                        bme280data->dig_h2[y] == 0 || bme280data->dig_h2[y] == 0xFFFF ||
+                                        bme280data->dig_h3[y] == 0 || bme280data->dig_h3[y] == 0xFF ||
+                                        bme280data->dig_h4[y] == 0 || bme280data->dig_h4[y] == 0xFFFF ||
+                                        bme280data->dig_h5[y] == 0 || bme280data->dig_h5[y] == 0xFFFF ||
+					bme280data->dig_h6[y] == 0 || bme280data->dig_h6[y] == 0xFF) {
+				logprintf(LOG_ERR, "data communication error");
+				exit(EXIT_FAILURE);
+			}
+		}
+	}
+
+	while (loop) {
+		if (protocol_thread_wait(node, interval, &nrloops) == ETIMEDOUT) {
+			pthread_mutex_lock(&lock);
+			for (y = 0; y < bme280data->nrid; y++) {
+				if (bme280data->fd[y] > 0) {
+					//// uncompensated temperature value
+					//unsigned short res = 0;
+
+					// write 0x01 into Register 0xF2 (ctrl_him) to set humidity oversampling.
+					wiringXI2CWriteReg8(bme280data->fd[y], 0xF2, 0x01);
+                                        // write 0x25 into Register 0xF4 (ctrl_meas) to set temp and press oversampling and
+					// request a forced reading.
+                                        wiringXI2CWriteReg8(bme280data->fd[y], 0xF4, 0x25);
+
+
+					// wait at least 4.5ms: we suspend execution for 5000 microseconds.
+					usleep(5000);
+
+					// read the eight bytes result from address 0xF7.
+					wiringXI2CWrite(bme280data->fd[y], 0xF7);
+					//ut = (unsigned short) readReg16(bme280data->fd[y], 0xF7);
+					unsigned char pmsb = wiringXI2CRead(bme280data->fd[y]);
+                                        unsigned char plsb = wiringXI2CRead(bme280data->fd[y]);
+                                        unsigned char pxsb = wiringXI2CRead(bme280data->fd[y]);
+                                        unsigned char tmsb = wiringXI2CRead(bme280data->fd[y]);
+                                        unsigned char tlsb = wiringXI2CRead(bme280data->fd[y]);
+                                        unsigned char txsb = wiringXI2CRead(bme280data->fd[y]);
+                                        unsigned char hmsb = wiringXI2CRead(bme280data->fd[y]);
+                                        unsigned char hlsb = wiringXI2CRead(bme280data->fd[y]);
+
+					unsigned int raw_temperature = 0;
+					raw_temperature = (raw_temperature | tmsb) << 8;
+					raw_temperature = (raw_temperature | tlsb) << 8;
+					raw_temperature = (raw_temperature | txsb) >> 4;
+
+					unsigned int raw_pressure = 0;
+					raw_pressure = (raw_pressure | pmsb) << 8;
+					raw_pressure = (raw_pressure | plsb) << 8;
+					raw_pressure = (raw_pressure | pxsb) >> 4;
+
+					unsigned int raw_humidity = 0;
+					raw_humidity = (raw_humidity | hmsb) << 8;
+					raw_humidity = (raw_humidity | hlsb);
+
+					signed int cal_temperature = ((((raw_temperature>>3) - ((signed int)bme280data->dig_t1[y] <<1))) * ((int32_t)bme280data->dig_t2[y])) >> 11 +
+						(((((raw_temperature>>4) - ((signed int)bme280data->dig_t1[y])) * ((adc_T>>4) - ((signed int)bme280data->dig_t1[y]))) >> 12) * ((signed int)bme280data->dig_t1[y])) >> 14;
+//int32_t getTemperatureCalibration(bme280_calib_data *cal, int32_t adc_T) {
+//  int32_t var1  = ((((adc_T>>3) - ((int32_t)cal->dig_T1 <<1))) *
+//     ((int32_t)cal->dig_T2)) >> 11;
+
+//  int32_t var2  = (((((adc_T>>4) - ((int32_t)cal->dig_T1)) *
+//       ((adc_T>>4) - ((int32_t)cal->dig_T1))) >> 12) *
+//     ((int32_t)cal->dig_T3)) >> 14;
+
+//  return var1 + var2;
+//}
+					float compensateTemperature = ((cal_temperature * 5 + 128) >> 8)/100;
+//float compensateTemperature(int32_t t_fine) {
+//  float T  = (t_fine * 5 + 128) >> 8;
+//  return T/100;
+//}
+					float compensatePressure = 0;
+					long var1 = ((long)cal_temperature) - 128000;
+					long var2 = var1 * var1 * (long)bme280data->dig_p6[y];
+					var2 = var2 + ((var1 * (long)bme280data->dig_p5[y]) << 17);
+					var2 = var2 + (((long)bme280data->dig_p4[y]) << 35);
+					var1 = ((var1 * var1 * (long)bme280data->dig_p3[y]) >> 8) + ((var1 * (long)bme280data->dig_p2[y]) << 12);
+					var1 = (((((long)1) << 47) + var1)) * ((long)bme280data->dig_p1[y]) >> 33;
+					if (var1 != 0) {
+						long p = 1048576 - raw_pressure;
+						p = (((p << 31) - var2) * 3125) / var1;
+						var1 = (((long)bme280data->dig_p9[y]) * (p >> 13) * (p>>13)) >> 25;
+						var2 = (((long)bme280data->dig_p8[y]) * p) >> 19;
+						p = ((p + var1 + var2) >> 8) + (((long)bme280data->dig_p7[y])<<4);
+						compensatePressure = (float)p / 256;
+					}
+//float compensatePressure(int32_t adc_P, bme280_calib_data *cal, int32_t t_fine) {
+//  int64_t var1, var2, p;
+
+//  var1 = ((int64_t)t_fine) - 128000;
+//  var2 = var1 * var1 * (int64_t)cal->dig_P6;
+//  var2 = var2 + ((var1*(int64_t)cal->dig_P5)<<17);
+//  var2 = var2 + (((int64_t)cal->dig_P4)<<35);
+//  var1 = ((var1 * var1 * (int64_t)cal->dig_P3)>>8) +
+//    ((var1 * (int64_t)cal->dig_P2)<<12);
+//  var1 = (((((int64_t)1)<<47)+var1))*((int64_t)cal->dig_P1)>>33;
+
+//  if (var1 == 0) {
+//    return 0;  // avoid exception caused by division by zero
+//  }
+//  p = 1048576 - adc_P;
+//  p = (((p<<31) - var2)*3125) / var1;
+//  var1 = (((int64_t)cal->dig_P9) * (p>>13) * (p>>13)) >> 25;
+//  var2 = (((int64_t)cal->dig_P8) * p) >> 19;
+
+//  p = ((p + var1 + var2) >> 8) + (((int64_t)cal->dig_P7)<<4);
+//  return (float)p/256;
+//}
+
+					//// calculate temperature (in units of 0.1 deg C) given uncompensated value
+					//int x1, x2;
+					//x1 = (((int) ut - (int) bme280data->ac6[y])) * (int) bme280data->ac5[y] >> 15;
+					//x2 = ((int) bme280data->mc[y] << 11) / (x1 + bme280data->md[y]);
+					//int b5 = x1 + x2;
+					//int temp = ((b5 + 8) >> 4);
+
+					// uncompensated pressure value
+					unsigned int up = 0;
+
+					// write 0x34+(BME280_OVERSAMPLING_SETTING<<6) into register 0xF4
+					// request a pressure reading with specified oversampling setting
+					wiringXI2CWriteReg8(bme280data->fd[y], 0xF4,
+							0x34 + (oversampling << 6));
+
+					// wait for conversion, delay time dependent on oversampling setting
+					unsigned int delay = (unsigned int) ((2 + (3 << oversampling)) * 1000);
+					usleep(delay);
+
+					// read the three byte result (block data): 0xF6 = MSB, 0xF7 = LSB and 0xF8 = XLSB
+					int msb = wiringXI2CReadReg8(bme280data->fd[y], 0xF6);
+					int lsb = wiringXI2CReadReg8(bme280data->fd[y], 0xF7);
+					int xlsb = wiringXI2CReadReg8(bme280data->fd[y], 0xF8);
+					up = (((unsigned int) msb << 16) | ((unsigned int) lsb << 8) | (unsigned int) xlsb)
+							>> (8 - oversampling);
+
+					// calculate pressure (in Pa) given uncompensated value
+					int x3, b3, b6, pressure;
+					unsigned int b4, b7;
+
+					// calculate B6
+					b6 = b5 - 4000;
+
+					// calculate B3
+					x1 = (bme280data->b2[y] * (b6 * b6) >> 12) >> 11;
+					x2 = (bme280data->ac2[y] * b6) >> 11;
+					x3 = x1 + x2;
+					b3 = (((bme280data->ac1[y] * 4 + x3) << oversampling) + 2) >> 2;
+
+					// calculate B4
+					x1 = (bme280data->ac3[y] * b6) >> 13;
+					x2 = (bme280data->b1[y] * ((b6 * b6) >> 12)) >> 16;
+					x3 = ((x1 + x2) + 2) >> 2;
+					b4 = (bme280data->ac4[y] * (unsigned int) (x3 + 32768)) >> 15;
+
+					// calculate B7
+					b7 = ((up - (unsigned int) b3) * ((unsigned int) 50000 >> oversampling));
+
+					// calculate pressure in Pa
+					pressure = b7 < 0x80000000 ? (int) ((b7 << 1) / b4) : (int) ((b7 / b4) << 1);
+					x1 = (pressure >> 8) * (pressure >> 8);
+					x1 = (x1 * 3038) >> 16;
+					x2 = (-7357 * pressure) >> 16;
+					pressure += (x1 + x2 + 3791) >> 4;
+
+					bme280->message = json_mkobject();
+					JsonNode *code = json_mkobject();
+					json_append_member(code, "id", json_mkstring(bme280data->id[y]));
+					json_append_member(code, "temperature", json_mknumber(((double) temp / 10) + temp_offset, 1)); // in deg C
+					json_append_member(code, "pressure", json_mknumber(((double) pressure / 100) + pressure_offset, 1)); // in hPa
+
+					json_append_member(bme280->message, "message", code);
+					json_append_member(bme280->message, "origin", json_mkstring("receiver"));
+					json_append_member(bme280->message, "protocol", json_mkstring(bme280->id));
+
+					if(pilight.broadcast != NULL) {
+						pilight.broadcast(bme280->id, bme280->message, PROTOCOL);
+					}
+					json_delete(bme280->message);
+					bme280->message = NULL;
+				} else {
+					logprintf(LOG_NOTICE, "error connecting to bme280");
+					logprintf(LOG_DEBUG, "(probably i2c bus error from wiringXI2CSetup)");
+					logprintf(LOG_DEBUG, "(maybe wrong id? use i2cdetect to find out)");
+					protocol_thread_wait(node, 1, &nrloops);
+				}
+			}
+			pthread_mutex_unlock(&lock);
+		}
+	}
+
+	if (bme280data->id) {
+		for (y = 0; y < bme280data->nrid; y++) {
+			FREE(bme280data->id[y]);
+		}
+		FREE(bme280data->id);
+	}
+	if (bme280data->ac1) {
+		FREE(bme280data->ac1);
+	}
+	if (bme280data->ac2) {
+		FREE(bme280data->ac2);
+	}
+	if (bme280data->ac3) {
+		FREE(bme280data->ac3);
+	}
+	if (bme280data->ac4) {
+		FREE(bme280data->ac4);
+	}
+	if (bme280data->ac5) {
+		FREE(bme280data->ac5);
+	}
+	if (bme280data->ac6) {
+		FREE(bme280data->ac6);
+	}
+	if (bme280data->b1) {
+		FREE(bme280data->b1);
+	}
+	if (bme280data->b2) {
+		FREE(bme280data->b2);
+	}
+	if (bme280data->mb) {
+		FREE(bme280data->mb);
+	}
+	if (bme280data->mc) {
+		FREE(bme280data->mc);
+	}
+	if (bme280data->md) {
+		FREE(bme280data->md);
+	}
+	if (bme280data->fd) {
+		for (y = 0; y < bme280data->nrid; y++) {
+			if (bme280data->fd[y] > 0) {
+				close(bme280data->fd[y]);
+			}
+		}
+		FREE(bme280data->fd);
+	}
+	FREE(bme280data);
+	threads--;
+
+	return (void *) NULL;
+}
+
+static struct threadqueue_t *initDev(JsonNode *jdevice) {
+	char *platform = GPIO_PLATFORM;
+
+	struct lua_state_t *state = plua_get_free_state();
+	if(config_setting_get_string(state->L, "gpio-platform", 0, &platform) != 0) {
+		logprintf(LOG_ERR, "no gpio-platform configured");
+		assert(lua_gettop(state->L) == 0);
+		plua_clear_state(state);
+		return NULL;
+	}
+	assert(lua_gettop(state->L) == 0);
+	plua_clear_state(state);
+	if(strcmp(platform, "none") == 0) {
+		FREE(platform);
+		logprintf(LOG_ERR, "no gpio-platform configured");
+		return NULL;
+	}
+	if(wiringXSetup(platform, logprintf1) < 0) {
+		FREE(platform);
+		return NULL;
+	} else {
+		FREE(platform);
+		loop = 1;
+		char *output = json_stringify(jdevice, NULL);
+		JsonNode *json = json_decode(output);
+		json_free(output);
+
+		struct protocol_threads_t *node = protocol_thread_init(bme280, json);
+		return threads_register("bme280", &thread, (void *) node, 0);
+	}
+}
+
+static void threadGC(void) {
+	loop = 0;
+	protocol_thread_stop(bme280);
+	while (threads > 0) {
+		usleep(10);
+	}
+	protocol_thread_free(bme280);
+}
+#endif
+
+#if !defined(MODULE) && !defined(_WIN32)
+__attribute__((weak))
+#endif
+void bme280Init(void) {
+#if !defined(__FreeBSD__) && !defined(_WIN32)
+	pthread_mutexattr_init(&attr);
+	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+	pthread_mutex_init(&lock, &attr);
+#endif
+
+	protocol_register(&bme280);
+	protocol_set_id(bme280, "bme280");
+	protocol_device_add(bme280, "bme280", "I2C Barometric Pressure and Temperature Sensor");
+	//protocol_device_add(bme280, "bmp085", "I2C Barometric Pressure and Temperature Sensor");
+	bme280->devtype = WEATHER;
+	bme280->hwtype = SENSOR;
+
+	options_add(&bme280->options, "i", "id", OPTION_HAS_VALUE, DEVICES_ID, JSON_STRING, NULL, "0x[0-9a-f]{2}");
+	options_add(&bme280->options, "o", "oversampling", OPTION_HAS_VALUE, DEVICES_SETTING, JSON_NUMBER, (void *) 1, "^[0123]$");
+	options_add(&bme280->options, "p", "pressure", OPTION_HAS_VALUE, DEVICES_VALUE, JSON_NUMBER, (void *) 0, "^[0-9]{1,3}$");
+	options_add(&bme280->options, "t", "temperature", OPTION_HAS_VALUE, DEVICES_VALUE, JSON_NUMBER, (void *) 0, "^[0-9]{1,3}$");
+	options_add(&bme280->options, "d", "i2c-path", OPTION_HAS_VALUE, DEVICES_ID, JSON_STRING, NULL, "^/dev/i2c-[0-9]{1,2}$");
+
+	options_add(&bme280->options, "0", "poll-interval", OPTION_HAS_VALUE, DEVICES_SETTING, JSON_NUMBER, (void *) 10, "[0-9]");
+	options_add(&bme280->options, "0", "pressure-offset", OPTION_HAS_VALUE, DEVICES_SETTING, JSON_NUMBER, (void *) 0, "[0-9]");
+	options_add(&bme280->options, "0", "temperature-offset", OPTION_HAS_VALUE, DEVICES_SETTING, JSON_NUMBER, (void *) 0, "[0-9]");
+	options_add(&bme280->options, "0", "temperature-decimals", OPTION_HAS_VALUE, GUI_SETTING, JSON_NUMBER, (void *) 1, "[0-9]");
+	options_add(&bme280->options, "0", "humidity-decimals", OPTION_HAS_VALUE, GUI_SETTING, JSON_NUMBER, (void *) 1, "[0-9]");
+	options_add(&bme280->options, "0", "pressure-decimals", OPTION_HAS_VALUE, GUI_SETTING, JSON_NUMBER, (void *) 1, "[0-9]");
+	options_add(&bme280->options, "0", "show-pressure", OPTION_HAS_VALUE, GUI_SETTING, JSON_NUMBER, (void *) 1, "^[10]{1}$");
+	options_add(&bme280->options, "0", "show-temperature", OPTION_HAS_VALUE, GUI_SETTING, JSON_NUMBER, (void *) 1, "^[10]{1}$");
+
+#if !defined(__FreeBSD__) && !defined(_WIN32)
+	bme280->initDev = &initDev;
+	bme280->threadGC = &threadGC;
+#endif
+}
+
+#if defined(MODULE) && !defined(_WIN32)
+void compatibility(struct module_t *module) {
+	module->name = "bme280";
+	module->version = "0.1";
+	module->reqversion = "0.0";
+	module->reqcommit = "1";
+}
+
+void init(void) {
+	bme280Init();
+}
+#endif

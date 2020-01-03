@@ -1,0 +1,3 @@
+	arpingInit();
+	pingInit();
+

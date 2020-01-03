@@ -1,0 +1,11 @@
+	#include "bme280.h"
+	#include "bmp180.h"
+	#include "dht11.h"
+	#include "dht22.h"
+	#include "ds18b20.h"
+	#include "ds18s20.h"
+	#include "gpio_switch.h"
+	#include "lm75.h"
+	#include "lm76.h"
+	#include "relay.h"
+
